@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  print-validator:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: print_validator_app
+    volumes:
+      - ./test_images:/app/test_images
+      - ./data:/app/data
+      - ./output:/app/output
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    environment:
+      - PYTHONUNBUFFERED=1
+      - EASYOCR_MODULE_PATH=/app/.easyocr
+
+  test-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: test_generator_app
+    command: python test_generator_gui.py
+    volumes:
+      - ./test_images:/app/test_images
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    environment:
+      - PYTHONUNBUFFERED=1
