@@ -1,0 +1,25 @@
+# venv и кэш
+calendar_env/
+venv/
+__pycache__/
+*.py[cod]
+
+# логи / отчёты / временное
+*.log
+*.xlsx
+*.csv
+tmp/
+.temp/
+test_images/
+
+# исходники Git
+.git
+.gitignore
+.gitattributes
+
+# большие локальные данные (монтируйте как volume)
+data/
+
+# ОС-мусор
+.DS_Store
+Thumbs.db

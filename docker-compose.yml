@@ -1,0 +1,13 @@
+services:
+  print-validator:
+    build: .
+    container_name: print-validator
+    ports:
+      - "7860:7860"
+    environment:
+      SERVER_NAME: "0.0.0.0"
+      PORT: "7860"
+      INBROWSER: "0"   # в контейнере браузер не открываем
+    volumes:
+      - ./data:/data:rw
+    restart: unless-stopped

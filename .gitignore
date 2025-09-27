@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+calendar_env/
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.swp
+
+# Отчёты (если не нужны в репо)
+*.xlsx
+*.csv
+
+# Данные (если не нужны в репо)
+data/
+test_images/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker: локальные настройки
+.env
+docker-compose.override.yml
