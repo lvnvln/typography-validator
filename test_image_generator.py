@@ -160,7 +160,7 @@ class TextTestGenerator:
         if add_guides:
             self.add_guidelines(draw, width_px, height_px, bleed_px, dpi)
         
-        # Добавляем текст с ИСПРАВЛЕННЫМИ координатами
+        # Добавляем текст
         for text_info in text_positions:
             if len(text_info) == 3:
                 text, x_mm_from_crop, y_mm_from_crop = text_info
