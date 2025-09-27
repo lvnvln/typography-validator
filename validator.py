@@ -1,410 +1,245 @@
+# validator.py
 """
-Модуль валидации изображений для типографии.
-Содержит классы для проверки соответствия изображений требованиям печати.
+Валидация изображений для типографии (Tesseract).
+СНАЧАЛА проверяются физические требования → затем OCR.
+Отступ текста меряем от линии обреза (границы вылета), а не от краёв изображения.
 """
 
+from __future__ import annotations
+
+import io
 import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
 from PIL import Image, ImageCms
-import numpy as np
-import easyocr
-import warnings
+import pytesseract
 
-# Игнорирование предупреждений PyTorch
-warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
+MM_PER_INCH = 25.4
 
-class TextDetector:
-    """Класс для обнаружения и анализа текста на изображениях"""
-    
-    def __init__(self):
-        """
-        Инициализация детектора текста с настройками по умолчанию
-        """
-        self.min_text_height = 8  # Минимальная высота текста в пикселях
-        self.min_confidence = 0.3  # Минимальная уверенность распознавания
-        self.min_safe_margin_mm = 5  # Минимальный безопасный отступ в мм
-        self.reader = None  # Инициализация читателя EasyOCR
-        self._initialize_reader()
-    
-    def _initialize_reader(self):
-        """Инициализация EasyOCR для распознавания русского и английского текста"""
-        try:
-            self.reader = easyocr.Reader(['ru', 'en'], gpu=False)
-            print("EasyOCR инициализирован успешно")
-        except ImportError:
-            print("Ошибка: EasyOCR не установлен. Установите: pip install easyocr")
-            self.reader = None
-        except Exception as e:
-            print(f"Ошибка инициализации EasyOCR: {e}")
-            self.reader = None
-    
-    def mm_to_pixels(self, mm, dpi):
-        """
-        Конвертирует миллиметры в пиксели с учетом DPI
-        
-        Args:
-            mm: Значение в миллиметрах
-            dpi: Разрешение изображения (точек на дюйм)
-            
-        Returns:
-            int: Значение в пикселях
-        """
-        return int(mm / 25.4 * dpi)
-    
-    def detect_text_regions(self, image_path, dpi):
-        """
-        Обнаруживает текстовые области на изображении
-        
-        Args:
-            image_path: Путь к файлу изображения
-            dpi: Разрешение изображения
-            
-        Returns:
-            list: Список обнаруженных текстовых областей
-        """
-        if self.reader is None:
-            print("Ошибка: EasyOCR не инициализирован")
-            return []
-            
-        try:
-            # Проверка существования файла
-            if not os.path.exists(image_path):
-                print(f"Ошибка: файл {image_path} не существует")
-                return []
-                
-            # Распознавание текста на изображении
-            results = self.reader.readtext(image_path, paragraph=False)
-            print(f"Найдено {len(results)} текстовых элементов")
-            
-            text_regions = []
-            min_safe_margin_px = self.mm_to_pixels(self.min_safe_margin_mm, dpi)
-            
-            # Обработка результатов распознавания
-            for (bbox, text, confidence) in results:
-                clean_text = text.strip()
-                # Пропуск пустого текста или текста с низкой уверенностью
-                if len(clean_text) < 1 or confidence < self.min_confidence:
-                    continue
-                    
-                try:
-                    points = np.array(bbox).astype(int)
-                    if points.shape != (4, 2):
-                        print(f"Некорректный формат bbox: {bbox}")
-                        continue
-                        
-                    # Вычисление границ текстовой области
-                    x_coords = points[:, 0]
-                    y_coords = points[:, 1]
-                    
-                    x1, x2 = min(x_coords), max(x_coords)
-                    y1, y2 = min(y_coords), max(y_coords)
-                    height = y2 - y1
-                    
-                    # Фильтрация по минимальной высоте текста
-                    if height >= self.min_text_height:
-                        text_regions.append({
-                            'text': clean_text,
-                            'bbox': (x1, y1, x2, y2),
-                            'confidence': confidence,
-                            'safe_margin_px': min_safe_margin_px
-                        })
-                        
-                except Exception as e:
-                    print(f"Ошибка обработки bbox {bbox}: {e}")
-                    continue
-            
-            print(f"Отфильтровано {len(text_regions)} регионов")
-            return text_regions
-            
-        except Exception as e:
-            print(f"Ошибка детекции текста: {e}")
-            return []
-    
-    def check_text_margins(self, text_regions, image_width, image_height, bleed_px, target_width_px, target_height_px):
-        """
-        Проверяет отступы текста от границ обрезной зоны
-        
-        Args:
-            text_regions: Список текстовых областей
-            image_width: Ширина изображения в пикселях
-            image_height: Высота изображения в пикселях
-            bleed_px: Размер вылета в пикселях
-            target_width_px: Ширина обрезной зоны в пикселях
-            target_height_px: Высота обрезной зоны в пикселях
-            
-        Returns:
-            list: Список нарушений расположения текста
-        """
-        violations = []
-        
-        for region in text_regions:
-            x1, y1, x2, y2 = region['bbox']
-            
-            # Вычисление минимального расстояния до границ обрезной зоны
-            min_distance = self.calculate_min_distance_to_crop(x1, y1, x2, y2, 
-                                                            bleed_px, target_width_px, target_height_px)
-            
-            # Проверка нарушения отступов
-            if min_distance < region['safe_margin_px']:
-                distance_mm = (abs(min_distance) * 25.4) / self.mm_to_pixels(1, 300)
-                
-                violation_type = "малое расстояние" if min_distance >= 0 else "выход за обрезную зону"
-                
-                violations.append({
-                    'text': region['text'],
-                    'bbox': region['bbox'],
-                    'distance_to_crop_mm': round(distance_mm, 2),
-                    'min_distance_px': min_distance,
-                    'required_distance_px': region['safe_margin_px'],
-                    'violation_type': violation_type
-                })
-        
-        return violations
-    
-    def calculate_min_distance_to_crop(self, x1, y1, x2, y2, bleed_px, target_width_px, target_height_px):
-        """
-        Вычисляет минимальное расстояние от текста до границ обрезной зоны
-        
-        Args:
-            x1, y1, x2, y2: Координаты текстовой области
-            bleed_px: Размер вылета в пикселях
-            target_width_px: Ширина обрезной зоны
-            target_height_px: Высота обрезной зоны
-            
-        Returns:
-            int: Минимальное расстояние в пикселях (отрицательное если текст выходит за границы)
-        """
-        # Границы обрезной зоны (белой области)
-        crop_left = bleed_px
-        crop_right = bleed_px + target_width_px
-        crop_top = bleed_px
-        crop_bottom = bleed_px + target_height_px
-        
-        # Проверка выхода текста за обрезную зону
-        if (x1 < crop_left or x2 > crop_right or y1 < crop_top or y2 > crop_bottom):
-            # Расчет перекрытия за границами обрезной зоны
-            overlap_left = max(0, crop_left - x1)
-            overlap_right = max(0, x2 - crop_right)
-            overlap_top = max(0, crop_top - y1)
-            overlap_bottom = max(0, y2 - crop_bottom)
-            
-            max_overlap = max(overlap_left, overlap_right, overlap_top, overlap_bottom)
-            return -max_overlap  # Отрицательное значение = текст выходит за обрезную зону
-        
-        # Текст внутри обрезной зоны - вычисление расстояний до границ
-        dist_to_left = x1 - crop_left
-        dist_to_right = crop_right - x2
-        dist_to_top = y1 - crop_top
-        dist_to_bottom = crop_bottom - y2
-        
-        # Минимальное расстояние до границ обрезной зоны
-        return min(dist_to_left, dist_to_right, dist_to_top, dist_to_bottom)
+
+@dataclass
+class Requirements:
+    file_size_mb_max: int = 100
+    color_space: str = "CMYK"          # только валидация, без автоконвертации
+    target_w_mm: int = 100             # обрезной размер
+    target_h_mm: int = 70
+    bleed_mm: int = 5                  # вылет с каждой стороны
+    min_dpi: int = 300
+    min_text_margin_mm: int = 5        # минимальный отступ от линии обреза
+
+
+def mm_to_px(mm: float, dpi: float) -> int:
+    return int(round(mm / MM_PER_INCH * dpi))
+
+
+def px_to_mm(px: float, dpi: float) -> float:
+    return float(px) * MM_PER_INCH / float(dpi) if dpi else 0.0
+
+
+class TesseractTextDetector:
+    """Лёгкий детектор текста на базе pytesseract.image_to_data."""
+    def __init__(self, min_confidence: int = 30, lang: str = "rus+eng") -> None:
+        self.min_confidence = int(min_confidence)   # 0..100
+        self.lang = lang
+
+    def detect(self, image: Image.Image) -> List[Dict[str, Any]]:
+        data = pytesseract.image_to_data(image, lang=self.lang, output_type=pytesseract.Output.DICT)
+        n = len(data.get("text", []))
+        regions: List[Dict[str, Any]] = []
+        for i in range(n):
+            txt = (data["text"][i] or "").strip()
+            conf_raw = data["conf"][i]
+            try:
+                conf = float(conf_raw)
+            except Exception:
+                conf = -1.0
+            if not txt or conf < self.min_confidence:
+                continue
+            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            regions.append(
+                {"text": txt, "bbox": (int(x), int(y), int(x + w), int(y + h)), "confidence": conf / 100.0}
+            )
+        return regions
 
 
 class ImageValidator:
-    """Основной класс для проверки изображений на соответствие требованиям типографии"""
-    
-    def __init__(self):
-        """
-        Инициализация валидатора с установкой требований типографии
-        """
-        self.requirements = {
-            'max_file_size': 100 * 1024 * 1024,  # 100 МБ
-            'color_space': 'CMYK',  # Требуемое цветовое пространство
-            'target_width_mm': 100,  # Ширина обрезного формата в мм
-            'target_height_mm': 70,  # Высота обрезного формата в мм
-            'bleed_mm': 5,  # Размер вылетов в мм
-            'min_dpi': 300,  # Минимальное разрешение
-            'min_text_margin_mm': 5  # Минимальный отступ текста
+    """
+    Порядок:
+      1) базовые/физические проверки (размер, цвет, DPI, геометрия/вылеты);
+      2) если ОК — OCR и проверка отступа текста от линии обреза.
+    """
+    def __init__(self, req: Requirements | None = None) -> None:
+        self.req = req or Requirements()
+        self.requirements: Dict[str, Any] = {
+            "file_size_mb_max": self.req.file_size_mb_max,
+            "color_space": self.req.color_space,
+            "target_w_mm": self.req.target_w_mm,
+            "target_h_mm": self.req.target_h_mm,
+            "bleed_mm": self.req.bleed_mm,
+            "min_dpi": self.req.min_dpi,
+            "min_text_margin_mm": self.req.min_text_margin_mm,
         }
-        
-        # Инициализация детектора текста
-        self.text_detector = TextDetector()
-        
-        # Расчет общих размеров с учетом вылетов
-        self.total_width_mm = self.requirements['target_width_mm'] + 2 * self.requirements['bleed_mm']
-        self.total_height_mm = self.requirements['target_height_mm'] + 2 * self.requirements['bleed_mm']
-    
-    def mm_to_pixels(self, mm, dpi):
-        """
-        Конвертирует мм в пиксели с учетом DPI
-        
-        Args:
-            mm: Значение в миллиметрах
-            dpi: Разрешение изображения
-            
-        Returns:
-            int: Значение в пикселях
-        """
-        inches = mm / 25.4
-        return int(inches * dpi)
-    
-    def get_color_space(self, image):
-        """
-        Определяет цветовое пространство изображения
-        
-        Args:
-            image: Объект изображения PIL
-            
-        Returns:
-            str: Название цветового пространства
-        """
+        self.text_detector = TesseractTextDetector()
+
+    # ---------- helpers ----------
+
+    def _get_dpi(self, im: Image.Image) -> Tuple[int, int]:
+        candidates = [
+            im.info.get("dpi"),
+            im.info.get("resolution"),
+            im.info.get("jpeg_res"),
+        ]
+        for dpi in candidates:
+            if not dpi:
+                continue
+            if isinstance(dpi, tuple) and len(dpi) >= 1:
+                xdpi = int(dpi[0])
+                ydpi = int(dpi[1] if len(dpi) > 1 else dpi[0])
+                return xdpi, ydpi
+            if isinstance(dpi, (int, float)):
+                return int(dpi), int(dpi)
+        return self.req.min_dpi, self.req.min_dpi
+
+    def _check_color_space(self, im: Image.Image) -> Tuple[bool, str]:
+        mode = (im.mode or "").upper()
+        if mode == "CMYK":
+            return True, "OK (mode=CMYK)"
+        icc = im.info.get("icc_profile")
+        if icc:
+            try:
+                profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                desc = (ImageCms.getProfileName(profile) or "").upper()
+                if "CMYK" in desc:
+                    return True, f"OK (ICC={desc})"
+                return False, f"ICC={desc}"
+            except Exception as e:
+                return False, f"ICC read error: {e!s}"
+        return False, f"mode={im.mode}"
+
+    # ---------- public ----------
+
+    def validate_file(self, path: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "filename": os.path.basename(path),
+            "path": path,
+            "printable": False,
+            "violations": [],
+            "text_regions": [],
+            "text_violations": [],
+            "text_violations_count": 0,
+            "mode": "unknown",
+            "color_space": None,
+            "dpi": None,
+            "size_px": None,
+            "width_mm": None,
+            "height_mm": None,
+            "file_mb": None,
+        }
+
+        # 0) размер файла
         try:
-            # Попытка определить цветовое пространство через ICC профиль
-            if hasattr(image, 'icc_profile') and image.icc_profile:
+            file_mb = os.path.getsize(path) / (1024 ** 2)
+            result["file_mb"] = round(file_mb, 2)
+            if file_mb > self.req.file_size_mb_max:
+                result["violations"].append(
+                    f"Размер файла {file_mb:.1f} МБ > {self.req.file_size_mb_max} МБ"
+                )
+        except Exception as e:
+            result["violations"].append(f"Не удалось прочитать размер файла: {e!s}")
+
+        # 1) открытие изображения
+        try:
+            with Image.open(path) as im:
+                result["mode"] = im.mode
+                result["color_space"] = im.mode
+
+                xdpi, ydpi = self._get_dpi(im)
+                dpi = min(xdpi, ydpi)
+                result["dpi"] = int(dpi)
+
+                w, h = im.size
+                result["size_px"] = (w, h)
+                result["width_mm"] = round(px_to_mm(w, dpi), 1) if dpi else None
+                result["height_mm"] = round(px_to_mm(h, dpi), 1) if dpi else None
+
+                # 2) цвет
+                ok_cs, cs_note = self._check_color_space(im)
+                if not ok_cs:
+                    result["violations"].append(f"Цветовое пространство не CMYK ({cs_note})")
+
+                # 3) DPI
+                if dpi < self.req.min_dpi:
+                    result["violations"].append(f"DPI={dpi} < {self.req.min_dpi}")
+
+                # 4) геометрия + вылеты
+                expected_w = mm_to_px(self.req.target_w_mm + 2 * self.req.bleed_mm, dpi)
+                expected_h = mm_to_px(self.req.target_h_mm + 2 * self.req.bleed_mm, dpi)
+                tol = 2  # допуск округления
+                if abs(w - expected_w) > tol or abs(h - expected_h) > tol:
+                    result["violations"].append(
+                        f"Размер с вылетами должен быть {expected_w}×{expected_h}px (при {dpi} dpi), по факту {w}×{h}px"
+                    )
+
+                # 5) если уже есть нарушения — НЕ запускаем OCR
+                if result["violations"]:
+                    result["printable"] = False
+                    return result
+
+                # 6) OCR
                 try:
-                    import io
-                    icc_profile = ImageCms.ImageCmsProfile(io.BytesIO(image.icc_profile))
-                    color_space = ImageCms.getProfileDescription(icc_profile).upper()
-                    if 'CMYK' in color_space:
-                        return 'CMYK'
-                    elif 'RGB' in color_space or 'SRGB' in color_space:
-                        return 'RGB'
-                    else:
-                        return color_space
-                except:
-                    return image.mode
-            else:
-                return image.mode
-        except:
-            return image.mode
-    
-    def check_basic_requirements(self, file_path):
-        """
-        Быстрая проверка основных требований (без OCR)
-        
-        Args:
-            file_path: Путь к файлу изображения
-            
-        Returns:
-            dict: Результаты базовой проверки
-        """
-        violations = []
-        
-        try:
-            # Проверка размера файла
-            file_size = os.path.getsize(file_path)
-            if file_size > self.requirements['max_file_size']:
-                violations.append(f"Размер файла {file_size/(1024*1024):.1f} МБ превышает 100 МБ")
-            
-            # Открытие и анализ изображения
-            with Image.open(file_path) as img:
-                # Проверка цветового пространства
-                color_space = self.get_color_space(img)
-                if color_space != self.requirements['color_space']:
-                    violations.append(f"Цветовое пространство: {color_space} (требуется: {self.requirements['color_space']})")
-                
-                # Получение DPI изображения
-                dpi = img.info.get('dpi', (72, 72))[0]
-                if dpi < self.requirements['min_dpi']:
-                    violations.append(f"Разрешение: {dpi} DPI (требуется: {self.requirements['min_dpi']}+ DPI)")
-                
-                # Расчет требуемых размеров в пикселях
-                required_width_px = self.mm_to_pixels(self.total_width_mm, dpi)
-                required_height_px = self.mm_to_pixels(self.total_height_mm, dpi)
-                
-                # Проверка размеров изображения
-                if img.width < required_width_px or img.height < required_height_px:
-                    violations.append(f"Размер изображения: {img.width}×{img.height}px (требуется: {required_width_px}×{required_height_px}px с учетом вылетов)")
-                
-                return {
-                    'filename': os.path.basename(file_path),
-                    'color_space': color_space,
-                    'dpi': dpi,
-                    'width_px': img.width,
-                    'height_px': img.height,
-                    'file_size_mb': file_size / (1024 * 1024),
-                    'violations': violations,
-                    'printable': len(violations) == 0
-                }
-                
-        except Exception as e:
-            return {
-                'filename': os.path.basename(file_path),
-                'color_space': 'Ошибка',
-                'dpi': 0,
-                'width_px': 0,
-                'height_px': 0,
-                'file_size_mb': 0,
-                'violations': [f"Ошибка открытия файла: {str(e)}"],
-                'printable': False
-            }
-    
-    def check_image(self, file_path):
-        """
-        Полная проверка изображения на соответствие требованиям
-        
-        Args:
-            file_path: Путь к файлу изображения
-            
-        Returns:
-            dict: Полные результаты проверки
-        """
-        # Быстрая проверка основных требований
-        basic_result = self.check_basic_requirements(file_path)
-        
-        # Если уже есть нарушения - возврат без OCR проверки
-        if not basic_result['printable']:
-            basic_result.update({
-                'text_regions': [],
-                'text_violations': [],
-                'text_violations_count': 0
-            })
-            return basic_result
-        
-        # Проверка текста если основные требования выполнены
-        violations = basic_result['violations'].copy()
-        text_violations = []
-        text_regions = []
-        
-        try:
-            with Image.open(file_path) as img:
-                dpi = img.info.get('dpi', (72, 72))[0]
-                
-                # Расчет размеров в пикселях
-                bleed_px = self.mm_to_pixels(self.requirements['bleed_mm'], dpi)
-                target_width_px = self.mm_to_pixels(self.requirements['target_width_mm'], dpi)
-                target_height_px = self.mm_to_pixels(self.requirements['target_height_mm'], dpi)
-                
-                # Проверка текста (только если DPI достаточный для OCR)
-                if dpi >= 150:
-                    # Детекция текстовых областей
-                    text_regions = self.text_detector.detect_text_regions(file_path, dpi)
-                    
-                    if text_regions:
-                        # Проверка отступов текста
-                        text_violations = self.text_detector.check_text_margins(
-                            text_regions, img.width, img.height, bleed_px, 
-                            target_width_px, target_height_px
+                    regions = self.text_detector.detect(im.convert("RGB"))
+                except Exception as e:
+                    regions = []
+                    result["violations"].append(f"Ошибка детекции текста: {e!s}")
+                    result["printable"] = False
+                    return result
+
+                result["text_regions"] = regions
+
+                # 7) проверка отступа от ЛИНИИ ОБРЕЗА (границы вылета)
+                bleed_px = mm_to_px(self.req.bleed_mm, dpi)
+                target_w_px = mm_to_px(self.req.target_w_mm, dpi)
+                target_h_px = mm_to_px(self.req.target_h_mm, dpi)
+
+                # координаты линии обреза (внутренняя граница вылета)
+                crop_left, crop_top = bleed_px, bleed_px
+                crop_right, crop_bottom = bleed_px + target_w_px, bleed_px + target_h_px
+
+                min_margin_px = mm_to_px(self.req.min_text_margin_mm, dpi)
+
+                text_violations: List[Dict[str, Any]] = []
+                for r in regions:
+                    x1, y1, x2, y2 = r["bbox"]
+
+                    # Минимальная "подписанная" дистанция до линий обреза:
+                    # если bbox пересекает линию или находится ближе чем min_margin_px с любой стороны (внутри или снаружи),
+                    # это нарушение. Мы НЕ отбрасываем боксы, которые целиком в вылете.
+                    dx_left = x1 - crop_left
+                    dx_right = crop_right - x2
+                    dy_top = y1 - crop_top
+                    dy_bottom = crop_bottom - y2
+
+                    min_dist_px = min(dx_left, dx_right, dy_top, dy_bottom)
+
+                    if min_dist_px < min_margin_px:
+                        # Для отчёта показываем абсолютное расстояние (0, если линия пересекается)
+                        abs_mm = round(px_to_mm(max(min_dist_px, 0), dpi), 2)
+                        text_violations.append(
+                            {
+                                "text": r.get("text", ""),
+                                "bbox": r["bbox"],
+                                "distance_to_crop_mm": abs_mm,
+                            }
                         )
-                        
-                        if text_violations:
-                            violations.append(f"Текст ближе {self.requirements['min_text_margin_mm']} мм к обрезному формату")
-                
-                # Формирование полного результата проверки
-                info = {
-                    'filename': basic_result['filename'],
-                    'color_space': basic_result['color_space'],
-                    'dpi': basic_result['dpi'],
-                    'width_px': basic_result['width_px'],
-                    'height_px': basic_result['height_px'],
-                    'width_mm': basic_result['width_px'] / dpi * 25.4 if dpi > 0 else 0,
-                    'height_mm': basic_result['height_px'] / dpi * 25.4 if dpi > 0 else 0,
-                    'file_size_mb': basic_result['file_size_mb'],
-                    'violations': violations,
-                    'text_regions': text_regions,
-                    'text_violations': text_violations,
-                    'text_violations_count': len(text_violations),
-                    'printable': len(violations) == 0
-                }
-                
-                return info
-                
+
+                result["text_violations"] = text_violations
+                result["text_violations_count"] = len(text_violations)
+                result["printable"] = (len(result["violations"]) == 0) and (len(text_violations) == 0)
+                return result
+
         except Exception as e:
-            basic_result['violations'].append(f"Ошибка проверки текста: {str(e)}")
-            basic_result['printable'] = False
-            basic_result.update({
-                'text_regions': [],
-                'text_violations': [],
-                'text_violations_count': 0
-            })
-            return basic_result
+            # Ошибка открытия/чтения изображения
+            result["violations"].append(f"Не удалось открыть изображение: {e!s}")
+            result["printable"] = False
+            return result

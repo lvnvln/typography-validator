@@ -1,31 +1,32 @@
-FROM python:3.13-slim
+# Рабочий вариант на стабильной Debian Bookworm
+FROM python:3.11-slim-bookworm
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_NO_CACHE_DIR=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DISPLAY=:99 \
-    VNC_GEOM=1280x800x24 \
-    NOVNC_PORT=8080 \
-    VNC_PORT=5900
+    DEBIAN_FRONTEND=noninteractive
 
+# Tesseract + языки rus/eng, Ghostscript (EPS), системные либы для Pillow/OpenCV-headless
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tk tcl xvfb x11vnc novnc websockify \
-    openbox \
-    ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+    tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
+    ghostscript \
+    libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Python-зависимости
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
+# Код
 COPY . /app
 
+EXPOSE 7860
 
-COPY docker/start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+# В контейнере слушаем на всех интерфейсах и не открываем браузер
+ENV SERVER_NAME=0.0.0.0 \
+    PORT=7860 \
+    INBROWSER=0
 
-EXPOSE 8080 5900
-ENTRYPOINT ["/usr/local/bin/start.sh"]
-CMD ["python", "main.py"]
+CMD ["python", "app.py"]

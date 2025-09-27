@@ -1,11 +1,13 @@
 services:
-  app:
+  print-validator:
     build: .
+    container_name: print-validator
     ports:
-      - "8080:8080"
-
+      - "7860:7860"
     environment:
-      - DISPLAY=:99
-      - VNC_GEOM=1440x900x24     
-      - NOVNC_PORT=8080
-      - VNC_PORT=5900
+      SERVER_NAME: "0.0.0.0"
+      PORT: "7860"
+      INBROWSER: "0"   # в контейнере браузер не открываем
+    volumes:
+      - ./data:/data:rw
+    restart: unless-stopped

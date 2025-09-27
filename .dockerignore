@@ -1,32 +1,25 @@
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-env
-pip-log.txt
-pip-delete-this-directory.txt
-.tox
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+# venv и кэш
+calendar_env/
+venv/
+__pycache__/
+*.py[cod]
+
+# логи / отчёты / временное
 *.log
-.git
-.mypy_cache
-.pytest_cache
-.history
-.DS_Store
-*.db
-*.sqlite3
-*.tmp
-*.temp
+*.xlsx
+*.csv
+tmp/
+.temp/
 test_images/
-data/
-output/
+
+# исходники Git
+.git
 .gitignore
-README.md
-docker-compose.yml
-Dockerfile
+.gitattributes
+
+# большие локальные данные (монтируйте как volume)
+data/
+
+# ОС-мусор
+.DS_Store
+Thumbs.db
