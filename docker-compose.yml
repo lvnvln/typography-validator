@@ -1,13 +1,16 @@
 services:
   print-validator:
-    build: .
-    container_name: print-validator
+    build:
+      context: .
+      dockerfile: dockerfile
+    image: calendar-a4:latest
     ports:
-      - "7860:7860"
+      - "7860:7860"          
     environment:
       SERVER_NAME: "0.0.0.0"
       PORT: "7860"
-      INBROWSER: "0"   # в контейнере браузер не открываем
-    volumes:
-      - ./data:/data:rw
+      PUBLIC_HOST: "localhost"  # то, что показываем в логах
+      PUBLIC_PORT: "7860"       # внешний порт из строки выше (левый)
+      PYTHONUNBUFFERED: "1"     # чтобы логи шли сразу
+      INBROWSER: "0"
     restart: unless-stopped

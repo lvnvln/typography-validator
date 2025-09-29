@@ -1,245 +1,177 @@
 # validator.py
 """
-Валидация изображений для типографии (Tesseract).
-СНАЧАЛА проверяются физические требования → затем OCR.
-Отступ текста меряем от линии обреза (границы вылета), а не от краёв изображения.
+Проверка и допустимая подготовка изображений под карточку 110×80 мм @ 300 dpi.
+
+Требования:
+- Цветовое пространство только CMYK (без автоконвертации).
+- Разрешён даунскейл (уменьшение).
+- Разрешён апскейл не более чем на 50% (×1.5).
+- Если пропорции не совпадают — выполняется cover-масштабирование и центрированная обрезка.
+- В финале изображение должно быть в CMYK и ровно целевого пиксельного размера (соответствующего 110×80 мм @ 300 dpi).
+
+Выход функции prepare_card(path):
+{
+  "ok": bool,
+  "prepared": PIL.Image | None,   # готовая карточка CMYK нужного размера @ 300 dpi
+  "info": {...},                  # метаданные (исходный размер, scale_used и пр.)
+  "reasons": [..],                # причины отказа
+  "notes": str                    # текстовая заметка о выполненных преобразованиях
+}
 """
 
 from __future__ import annotations
-
-import io
-import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
-
-from PIL import Image, ImageCms
-import pytesseract
+from typing import Tuple, Dict, Any, Optional
+from PIL import Image
 
 MM_PER_INCH = 25.4
 
-
-@dataclass
-class Requirements:
-    file_size_mb_max: int = 100
-    color_space: str = "CMYK"          # только валидация, без автоконвертации
-    target_w_mm: int = 100             # обрезной размер
-    target_h_mm: int = 70
-    bleed_mm: int = 5                  # вылет с каждой стороны
-    min_dpi: int = 300
-    min_text_margin_mm: int = 5        # минимальный отступ от линии обреза
-
-
-def mm_to_px(mm: float, dpi: float) -> int:
+def mm_to_px(mm: float, dpi: int) -> int:
+    """Миллиметры → пиксели при заданном dpi."""
     return int(round(mm / MM_PER_INCH * dpi))
 
+@dataclass
+class PrepRequirements:
+    # ФИЗИЧЕСКИЕ ТРЕБОВАНИЯ (обрезной + вылеты)
+    crop_w_mm: float = 100.0
+    crop_h_mm: float = 70.0
+    bleed_mm: float = 5.0            # с каждой стороны
+    dpi: int = 300
 
-def px_to_mm(px: float, dpi: float) -> float:
-    return float(px) * MM_PER_INCH / float(dpi) if dpi else 0.0
+    # ПРАВИЛА ПРЕОБРАЗОВАНИЙ
+    max_upscale: float = 1.5         # жёсткий запрет апскейла > 50%
+    require_cmyk: bool = True        # RGB не трогаем, помечаем как неподходящие
+
+    # СПРАВОЧНО (контроль 100 МБ делается на этапе сборки листа при сохранении)
+    max_output_mb: float = 100.0
+
+    @property
+    def target_w_px(self) -> int:
+        """Ширина целевой карточки (включая вылеты) в пикселях @ dpi."""
+        return mm_to_px(self.crop_w_mm + 2 * self.bleed_mm, self.dpi)
+
+    @property
+    def target_h_px(self) -> int:
+        """Высота целевой карточки (включая вылеты) в пикселях @ dpi."""
+        return mm_to_px(self.crop_h_mm + 2 * self.bleed_mm, self.dpi)
+
+    @property
+    def target_ratio(self) -> float:
+        """Отношение сторон целевой карточки (для справки)."""
+        return self.target_w_px / self.target_h_px
 
 
-class TesseractTextDetector:
-    """Лёгкий детектор текста на базе pytesseract.image_to_data."""
-    def __init__(self, min_confidence: int = 30, lang: str = "rus+eng") -> None:
-        self.min_confidence = int(min_confidence)   # 0..100
-        self.lang = lang
-
-    def detect(self, image: Image.Image) -> List[Dict[str, Any]]:
-        data = pytesseract.image_to_data(image, lang=self.lang, output_type=pytesseract.Output.DICT)
-        n = len(data.get("text", []))
-        regions: List[Dict[str, Any]] = []
-        for i in range(n):
-            txt = (data["text"][i] or "").strip()
-            conf_raw = data["conf"][i]
-            try:
-                conf = float(conf_raw)
-            except Exception:
-                conf = -1.0
-            if not txt or conf < self.min_confidence:
-                continue
-            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-            regions.append(
-                {"text": txt, "bbox": (int(x), int(y), int(x + w), int(y + h)), "confidence": conf / 100.0}
-            )
-        return regions
-
-
-class ImageValidator:
+class ImagePreparer:
     """
-    Порядок:
-      1) базовые/физические проверки (размер, цвет, DPI, геометрия/вылеты);
-      2) если ОК — OCR и проверка отступа текста от линии обреза.
+    Валидатор/подготовщик изображений.
+    Никакой цветовой конвертации не выполняется — только CMYK-исходники допускаются.
     """
-    def __init__(self, req: Requirements | None = None) -> None:
-        self.req = req or Requirements()
-        self.requirements: Dict[str, Any] = {
-            "file_size_mb_max": self.req.file_size_mb_max,
-            "color_space": self.req.color_space,
-            "target_w_mm": self.req.target_w_mm,
-            "target_h_mm": self.req.target_h_mm,
-            "bleed_mm": self.req.bleed_mm,
-            "min_dpi": self.req.min_dpi,
-            "min_text_margin_mm": self.req.min_text_margin_mm,
-        }
-        self.text_detector = TesseractTextDetector()
+
+    def __init__(self, req: Optional[PrepRequirements] = None):
+        self.req = req or PrepRequirements()
 
     # ---------- helpers ----------
 
-    def _get_dpi(self, im: Image.Image) -> Tuple[int, int]:
-        candidates = [
-            im.info.get("dpi"),
-            im.info.get("resolution"),
-            im.info.get("jpeg_res"),
-        ]
-        for dpi in candidates:
-            if not dpi:
-                continue
-            if isinstance(dpi, tuple) and len(dpi) >= 1:
-                xdpi = int(dpi[0])
-                ydpi = int(dpi[1] if len(dpi) > 1 else dpi[0])
-                return xdpi, ydpi
-            if isinstance(dpi, (int, float)):
-                return int(dpi), int(dpi)
-        return self.req.min_dpi, self.req.min_dpi
+    def _open_image(self, path: str) -> Image.Image:
+        """Открытие изображения PIL с принудительной загрузкой данных (load())."""
+        im = Image.open(path)
+        try:
+            im.load()
+        except Exception:
+            pass
+        return im
 
-    def _check_color_space(self, im: Image.Image) -> Tuple[bool, str]:
-        mode = (im.mode or "").upper()
-        if mode == "CMYK":
-            return True, "OK (mode=CMYK)"
-        icc = im.info.get("icc_profile")
-        if icc:
-            try:
-                profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
-                desc = (ImageCms.getProfileName(profile) or "").upper()
-                if "CMYK" in desc:
-                    return True, f"OK (ICC={desc})"
-                return False, f"ICC={desc}"
-            except Exception as e:
-                return False, f"ICC read error: {e!s}"
-        return False, f"mode={im.mode}"
+    def _get_mode(self, im: Image.Image) -> str:
+        """Возвращает режим; считаем корректным только 'CMYK'."""
+        return "CMYK" if im.mode == "CMYK" else im.mode
+
+    def _calc_cover_scale(self, src_w: int, src_h: int, tgt_w: int, tgt_h: int) -> float:
+        """
+        Минимальный масштаб (cover), чтобы и ширина, и высота цели оказались покрыты источником.
+        Возможен как даунскейл (<1), так и апскейл (>1).
+        """
+        return max(tgt_w / src_w, tgt_h / src_h)
+
+    def _resize(self, im: Image.Image, size: Tuple[int, int]) -> Image.Image:
+        """Масштабирование с хорошим ресемплером."""
+        return im.resize(size, Image.Resampling.LANCZOS)
+
+    def _center_crop(self, im: Image.Image, tw: int, th: int) -> Image.Image:
+        """Центрированная обрезка до нужного пиксельного размера."""
+        w, h = im.size
+        x0 = max(0, (w - tw) // 2)
+        y0 = max(0, (h - th) // 2)
+        return im.crop((x0, y0, x0 + tw, y0 + th))
 
     # ---------- public ----------
 
-    def validate_file(self, path: str) -> Dict[str, Any]:
-        result: Dict[str, Any] = {
-            "filename": os.path.basename(path),
-            "path": path,
-            "printable": False,
-            "violations": [],
-            "text_regions": [],
-            "text_violations": [],
-            "text_violations_count": 0,
-            "mode": "unknown",
-            "color_space": None,
-            "dpi": None,
-            "size_px": None,
-            "width_mm": None,
-            "height_mm": None,
-            "file_mb": None,
+    def prepare_card(self, path: str) -> Dict[str, Any]:
+        """
+        Проверяет и при необходимости готовит исходное изображение под карточку 110×80 мм @ 300 dpi.
+        Допустимые операции: даунскейл / апскейл ≤ 1.5 / cover + центрированная обрезка.
+        Цветовое пространство: ТОЛЬКО CMYK. DPI метаданные проставляются как 300×300.
+        """
+        out: Dict[str, Any] = {"ok": False, "prepared": None, "info": {}, "reasons": [], "notes": ""}
+
+        # 0) открыть
+        try:
+            im = self._open_image(path)
+        except Exception as e:
+            out["reasons"].append(f"Не удалось открыть изображение: {e}")
+            return out
+
+        mode = self._get_mode(im)
+        w, h = im.size
+        dpi_meta = im.info.get("dpi", None)  # может быть (x, y) или None
+
+        tgt_w, tgt_h = self.req.target_w_px, self.req.target_h_px
+        out["info"] = {
+            "mode": mode,
+            "dpi": dpi_meta[0] if isinstance(dpi_meta, tuple) else dpi_meta,
+            "src_size_px": (w, h),
+            "target_px": (tgt_w, tgt_h),
+            "scale_used": 1.0
         }
 
-        # 0) размер файла
+        # 1) цветовое пространство — никаких автоконверсий
+        if self.req.require_cmyk and mode != "CMYK":
+            out["reasons"].append("Цветовое пространство не CMYK (автоконвертация запрещена).")
+            return out
+
+        # 2) минимально необходимый cover-масштаб
+        scale = self._calc_cover_scale(w, h, tgt_w, tgt_h)
+        if scale > 1.0 and scale > self.req.max_upscale:
+            out["reasons"].append(f"Требуется увеличение ×{scale:.2f} (> {self.req.max_upscale}).")
+            return out
+
+        # 3) масштабирование (downscale или допустимый upscale ≤ 1.5)
+        new_w = max(tgt_w, int(round(w * scale)))
+        new_h = max(tgt_h, int(round(h * scale)))
         try:
-            file_mb = os.path.getsize(path) / (1024 ** 2)
-            result["file_mb"] = round(file_mb, 2)
-            if file_mb > self.req.file_size_mb_max:
-                result["violations"].append(
-                    f"Размер файла {file_mb:.1f} МБ > {self.req.file_size_mb_max} МБ"
-                )
+            im2 = self._resize(im, (new_w, new_h))
         except Exception as e:
-            result["violations"].append(f"Не удалось прочитать размер файла: {e!s}")
+            out["reasons"].append(f"Ошибка масштабирования: {e}")
+            return out
 
-        # 1) открытие изображения
-        try:
-            with Image.open(path) as im:
-                result["mode"] = im.mode
-                result["color_space"] = im.mode
+        # 4) привести строго к целевому размеру пикселей (центр-кроп)
+        if im2.size != (tgt_w, tgt_h):
+            im2 = self._center_crop(im2, tgt_w, tgt_h)
 
-                xdpi, ydpi = self._get_dpi(im)
-                dpi = min(xdpi, ydpi)
-                result["dpi"] = int(dpi)
+        # 5) снова проверяем режим (мы его не меняли — но если исходник не CMYK, отклоняем)
+        if im2.mode != "CMYK":
+            out["reasons"].append("Получился не CMYK после чтения (конвертация запрещена).")
+            return out
 
-                w, h = im.size
-                result["size_px"] = (w, h)
-                result["width_mm"] = round(px_to_mm(w, dpi), 1) if dpi else None
-                result["height_mm"] = round(px_to_mm(h, dpi), 1) if dpi else None
+        # 6) проставить метаданные DPI=300 (это не цветовая конвертация)
+        im2.info["dpi"] = (self.req.dpi, self.req.dpi)
 
-                # 2) цвет
-                ok_cs, cs_note = self._check_color_space(im)
-                if not ok_cs:
-                    result["violations"].append(f"Цветовое пространство не CMYK ({cs_note})")
-
-                # 3) DPI
-                if dpi < self.req.min_dpi:
-                    result["violations"].append(f"DPI={dpi} < {self.req.min_dpi}")
-
-                # 4) геометрия + вылеты
-                expected_w = mm_to_px(self.req.target_w_mm + 2 * self.req.bleed_mm, dpi)
-                expected_h = mm_to_px(self.req.target_h_mm + 2 * self.req.bleed_mm, dpi)
-                tol = 2  # допуск округления
-                if abs(w - expected_w) > tol or abs(h - expected_h) > tol:
-                    result["violations"].append(
-                        f"Размер с вылетами должен быть {expected_w}×{expected_h}px (при {dpi} dpi), по факту {w}×{h}px"
-                    )
-
-                # 5) если уже есть нарушения — НЕ запускаем OCR
-                if result["violations"]:
-                    result["printable"] = False
-                    return result
-
-                # 6) OCR
-                try:
-                    regions = self.text_detector.detect(im.convert("RGB"))
-                except Exception as e:
-                    regions = []
-                    result["violations"].append(f"Ошибка детекции текста: {e!s}")
-                    result["printable"] = False
-                    return result
-
-                result["text_regions"] = regions
-
-                # 7) проверка отступа от ЛИНИИ ОБРЕЗА (границы вылета)
-                bleed_px = mm_to_px(self.req.bleed_mm, dpi)
-                target_w_px = mm_to_px(self.req.target_w_mm, dpi)
-                target_h_px = mm_to_px(self.req.target_h_mm, dpi)
-
-                # координаты линии обреза (внутренняя граница вылета)
-                crop_left, crop_top = bleed_px, bleed_px
-                crop_right, crop_bottom = bleed_px + target_w_px, bleed_px + target_h_px
-
-                min_margin_px = mm_to_px(self.req.min_text_margin_mm, dpi)
-
-                text_violations: List[Dict[str, Any]] = []
-                for r in regions:
-                    x1, y1, x2, y2 = r["bbox"]
-
-                    # Минимальная "подписанная" дистанция до линий обреза:
-                    # если bbox пересекает линию или находится ближе чем min_margin_px с любой стороны (внутри или снаружи),
-                    # это нарушение. Мы НЕ отбрасываем боксы, которые целиком в вылете.
-                    dx_left = x1 - crop_left
-                    dx_right = crop_right - x2
-                    dy_top = y1 - crop_top
-                    dy_bottom = crop_bottom - y2
-
-                    min_dist_px = min(dx_left, dx_right, dy_top, dy_bottom)
-
-                    if min_dist_px < min_margin_px:
-                        # Для отчёта показываем абсолютное расстояние (0, если линия пересекается)
-                        abs_mm = round(px_to_mm(max(min_dist_px, 0), dpi), 2)
-                        text_violations.append(
-                            {
-                                "text": r.get("text", ""),
-                                "bbox": r["bbox"],
-                                "distance_to_crop_mm": abs_mm,
-                            }
-                        )
-
-                result["text_violations"] = text_violations
-                result["text_violations_count"] = len(text_violations)
-                result["printable"] = (len(result["violations"]) == 0) and (len(text_violations) == 0)
-                return result
-
-        except Exception as e:
-            # Ошибка открытия/чтения изображения
-            result["violations"].append(f"Не удалось открыть изображение: {e!s}")
-            result["printable"] = False
-            return result
+        out["ok"] = True
+        out["prepared"] = im2
+        out["info"]["scale_used"] = scale
+        if scale < 1.0:
+            out["notes"] = f"Уменьшено до {tgt_w}×{tgt_h}px (включая вылет)."
+        elif scale > 1.0:
+            out["notes"] = f"Увеличено ×{scale:.3f} до {tgt_w}×{tgt_h}px (включая вылет)."
+        else:
+            out["notes"] = "Без масштабирования; приведено к целевому размеру (включая вылет)."
+        return out

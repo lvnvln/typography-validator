@@ -1,32 +1,30 @@
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 
-# Виртуальные окружения
+# venv
 .venv/
 venv/
 env/
 calendar_env/
 
-# Логи и временные файлы
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Временные и выходные
 *.log
 *.tmp
 *.swp
-
-# Отчёты (если не нужны в репо)
 *.xlsx
 *.csv
 
-# Данные (если не нужны в репо)
+# Локальные данные/тесты
 data/
 test_images/
 
-# IDE / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Docker: локальные настройки
+# Docker локалки
 .env
 docker-compose.override.yml

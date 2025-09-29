@@ -1,25 +1,35 @@
-# venv и кэш
-calendar_env/
-venv/
-__pycache__/
-*.py[cod]
-
-# логи / отчёты / временное
-*.log
-*.xlsx
-*.csv
-tmp/
-.temp/
-test_images/
-
-# исходники Git
+# VCS / метаданные
 .git
 .gitignore
-.gitattributes
 
-# большие локальные данные (монтируйте как volume)
-data/
+# Python артефакты
+__pycache__/
+*.py[cod]
+*.pyo
 
-# ОС-мусор
+# Виртуальные окружения
+.venv/
+venv/
+env/
+calendar_env/
+
+# ОС / IDE
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+
+# Временные/выходные файлы
+*.log
+*.tmp
+*.swp
+*.xlsx
+*.csv
+
+# Тестовые/пример-данные (не нужны в образе)
+test_images/
+data/
+
+# Локальные конфиги docker-compose
+docker-compose.override.yml
+.env
